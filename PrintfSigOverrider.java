@@ -1,33 +1,37 @@
 //@category Functions
 
-import java.util.LinkedList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
+import java.util.StringJoiner;
 import java.util.regex.MatchResult;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
 
+import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
+import ghidra.app.plugin.core.analysis.ConstantPropagationAnalyzer;
 import ghidra.app.script.GhidraScript;
-import ghidra.app.services.DataTypeManagerService;
 import ghidra.app.util.parser.FunctionSignatureParser;
 import ghidra.program.model.address.Address;
-import ghidra.program.model.data.CharDataType;
-import ghidra.program.model.data.DataUtilities;
-import ghidra.program.model.data.IntegerDataType;
-import ghidra.program.model.data.LongDataType;
-import ghidra.program.model.data.ShortDataType;
-import ghidra.program.model.data.StringDataType;
-import ghidra.program.model.data.UnsignedIntegerDataType;
-import ghidra.program.model.data.UnsignedLongDataType;
-import ghidra.program.model.data.UnsignedShortDataType;
+import ghidra.program.model.data.*;
 import ghidra.program.model.data.DataUtilities.ClearDataMode;
 import ghidra.program.model.listing.Data;
 import ghidra.program.model.listing.Function;
-import ghidra.program.model.listing.FunctionSignature;
 import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.Parameter;
+import ghidra.program.model.listing.Program;
+import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.pcode.HighFunctionDBUtil;
+import ghidra.program.model.symbol.RefType;
 import ghidra.program.model.symbol.Reference;
+import ghidra.program.model.symbol.Symbol;
+import ghidra.program.model.symbol.SymbolType;
 import ghidra.program.util.SymbolicPropogator;
+import ghidra.util.classfinder.ClassSearcher;
+import ghidra.util.exception.CancelledException;
+import ghidra.util.task.TaskMonitor;
 
 public class PrintfSigOverrider extends GhidraScript {
 
@@ -36,68 +40,84 @@ public class PrintfSigOverrider extends GhidraScript {
         "Currently only processors passing parameters via registers are supported.";
 
     private static final Pattern FORMAT_PATTERN =
-        Pattern.compile("%\\S*([lLh]?[cdieEfgGosuxXpn%])");
+        Pattern.compile("%\\d*([lLh]?[cdieEfgGosuxXpn%])");
 
-    private static final String DEC = "int printf(char* format%s)";
-    
-    private static final String FLOAT = "float";
-    private static final String DOUBLE = "double";
-    private static final String CHAR_PTR = "char *";
-    private static final String WCHAR = "wchar_t";
-    private static final String WCHAR_PTR = WCHAR+" *";
-    private static final String LONG_DOUBLE = "long double";
-    private static final String POINTER = "pointer";
+    private static final String PREFIX = "int printf(";
+	private static final String DELIMITER = ",";
+	private static final String SUFFIX = ")";
+	
+	private static final FunctionSignatureParser PARSER = 
+		new FunctionSignatureParser(BuiltInDataTypeManager.getDataTypeManager(), null);
 
-    private static final String UNEXPECTED_FORMAT = "Unexpected specifier in format\n";
-    private static final String SEPARATOR = ", ";
+	private static boolean isFunction(Symbol s) {
+		return s.getSymbolType() == SymbolType.FUNCTION;
+	}
+
+	private static boolean isCall(Reference r) {
+		final RefType type = r.getReferenceType();
+		if (type.isCall()) {
+			return !(type.isComputed() || type.isIndirect());
+		}
+		return false;
+	}
 
     @Override
     public void run() throws Exception {
-        List<Function> functions = getGlobalFunctions(PRINT_F);
-        for (Function function : functions) {
-            monitor.checkCanceled();
-            Parameter format = function.getParameter(0);
-            if (format == null) {
-                continue;
-            }
-            if (!format.isRegisterVariable()) {
-                popup(UNSUPPORTED_MESSAGE);
-                return;
-            }
-            Reference[] references = getReferencesTo(function.getEntryPoint());
-            monitor.setMessage("Overriding Signatures for "+function.getName());
-            monitor.initialize(references.length);
-            for (Reference ref : references) {
-                monitor.checkCanceled();
-                if (!ref.getReferenceType().isCall()) {
-                    monitor.incrementProgress(1);
-                    continue;
-                }
-                Address callAddr = ref.getFromAddress();
-                Function callee = getFunctionContaining(callAddr);
-                if (callee == null) {
-                    monitor.incrementProgress(1);
-                    continue;
-                }
-                SymbolicPropogator prop = analyzeFunction(callee, monitor);
-                Address nextAddr = movePastDelaySlot(callAddr);
-                SymbolicPropogator.Value value = prop.getRegisterValue(nextAddr, format.getRegister());
-                if (value == null) {
-                    monitor.incrementProgress(1);
-                    continue;
-                }
-                Address stringAddress = toAddr(value.getValue());
-                Data data = getDataAt(stringAddress);
-                if (data == null || !data.hasStringValue()) {
-                    data = DataUtilities.createData(currentProgram, stringAddress,
-                        StringDataType.dataType, -1, false, ClearDataMode.CLEAR_ALL_CONFLICT_DATA);
-                }
-                String msg = (String) data.getValue();
-                overrideFunction(function, callAddr, msg);
-                monitor.incrementProgress(1);
-            }
+		Optional<Symbol> s = StreamSupport.stream(currentProgram.getSymbolTable()
+										  .getSymbolIterator(PRINT_F, true)
+										  .spliterator(), false)
+										  .filter(PrintfSigOverrider::isFunction)
+										  .findFirst();
+		if (s.isPresent()) {
+			final Parameter format = ((Function) s.get().getObject()).getParameter(0);
+			if (format == null) {
+				printerr("Unable to retrieve format parameter");
+				return;
+			}
+			if (!format.isRegisterVariable()) {
+				popup(UNSUPPORTED_MESSAGE);
+				return;
+			}
+			List<Address> addresses = Arrays.stream(s.get().getReferences())
+					.filter(PrintfSigOverrider::isCall)
+					.map(Reference::getFromAddress)
+					.collect(Collectors.toList());
+			monitor.initialize(addresses.size());
+			monitor.setMessage("Overriding printf calls");
+			for (Address address : addresses) {
+				monitor.checkCanceled();
+				Function function = getFunctionContaining(address);
+				if (function == null) {
+					monitor.incrementProgress(1);
+					continue;
+				}
+				SymbolicPropogator prop = analyzeFunction(function, monitor);
+				Address nextAddr = movePastDelaySlot(address);
+				SymbolicPropogator.Value value =
+					prop.getRegisterValue(nextAddr, format.getRegister());
+				if (value != null) {
+					Address stringAddress = toAddr(value.getValue());
+					if (isValidAddress(stringAddress)) {
+						Data data = getDataAt(stringAddress);
+						if (data == null || !data.hasStringValue()) {
+							clearListing(stringAddress);
+							data = DataUtilities.createData(
+								currentProgram, stringAddress, StringDataType.dataType, -1, false,
+								ClearDataMode.CLEAR_ALL_CONFLICT_DATA);
+						}
+						String msg = (String) data.getValue();
+						overrideFunction(function, address, msg);
+					}
+				}
+				monitor.incrementProgress(1);
+			}
         }
-    }
+	}
+	
+	private boolean isValidAddress(Address address) {
+		final MemoryBlock block = getMemoryBlock(address);
+		return block != null && !block.isExecute();
+	}
 
     private Address movePastDelaySlot(Address addr) {
         Instruction inst = getInstructionAt(addr);
@@ -117,8 +137,11 @@ public class PrintfSigOverrider extends GhidraScript {
             }
             boolean commit = false;
             try {
-                HighFunctionDBUtil.writeOverride(function, address, getFunctionSignature(format));
-                commit = true;
+				final FunctionDefinition def = getFunctionSignature(format, function);
+				if (def != null) {
+					HighFunctionDBUtil.writeOverride(function, address, def);
+					commit = true;
+				}
             }
             catch (Exception e) {
                 printerr("Error overriding signature: " + e.getMessage());
@@ -128,113 +151,113 @@ public class PrintfSigOverrider extends GhidraScript {
                     currentProgram.endTransaction(transaction, commit);
                 }
             }
-    }
+	}
+	
+	private DataType toDataType(CharSequence match) {
+		if (match.charAt(0) == 'h') {
+			switch(match.charAt(1)) {
+				case 'i':
+				case 'd':
+				case 'o':
+					return ShortDataType.dataType;
+				case 'u':
+				case 'x':
+				case 'X':
+					return UnsignedShortDataType.dataType;
+				default:
+					printerr("Unknown specifier "+match);
+					return Undefined1DataType.dataType;
+			}
+		} else if (match.charAt(0) == 'l') {
+			switch(match.charAt(1)) {
+				case 'c':
+					return WideCharDataType.dataType;
+				case 's':
+					return PointerDataType.getPointer(WideCharDataType.dataType, -1);
+				case 'i':
+				case 'd':
+				case 'o':
+					return LongDataType.dataType;
+				case 'u':
+				case 'x':
+				case 'X':
+					return UnsignedLongDataType.dataType;
+				case 'e':
+				case 'E':
+				case 'f':
+				case 'g':
+				case 'G':
+					return DoubleDataType.dataType;
+				default:
+					printerr("Unknown specifier "+match);
+					return DataType.DEFAULT;
+			}
+		} else if (match.charAt(0) == 'L') {
+			switch(match.charAt(1)) {
+				case 'e':
+				case 'E':
+				case 'f':
+				case 'g':
+				case 'G':
+					return LongDoubleDataType.dataType;
+				default:
+					printerr("Unknown specifier "+match);
+					return DataType.DEFAULT;
+			}
+		} else {
+			switch(match.charAt(0)) {
+				case 'c':
+					return CharDataType.dataType;
+				case 's':
+					return PointerDataType.getPointer(CharDataType.dataType, -1);
+				case 'i':
+				case 'd':
+				case 'o':
+					return IntegerDataType.dataType;
+				case 'u':
+				case 'x':
+				case 'X':
+					return UnsignedIntegerDataType.dataType;
+				case 'e':
+				case 'E':
+				case 'f':
+				case 'g':
+				case 'G':
+					return FloatDataType.dataType;
+				case 'p':
+					return PointerDataType.dataType;
+				default:
+					printerr("Unknown specifier "+match);
+					return DataType.DEFAULT;
+			}
+		}
+	}
 
-    private FunctionSignature getFunctionSignature(String format) throws Exception {
-        FunctionSignatureParser parser = new FunctionSignatureParser(
-        currentProgram.getDataTypeManager(),
-        getState().getTool().getService(DataTypeManagerService.class));
-        Matcher matcher = FORMAT_PATTERN.matcher(format);
-        List<String> types = new LinkedList<>();
-        String[] matches = matcher.results().map(MatchResult::group).toArray(String[]::new);
-        for (String match : matches) {
-            if (match.charAt(0) == 'h') {
-                switch(match.charAt(1)) {
-                    case 'i':
-                    case 'd':
-                    case 'o':
-                        types.add(ShortDataType.dataType.getCDeclaration());
-                        break;
-                    case 'u':
-                    case 'x':
-                    case 'X':
-                        types.add(UnsignedShortDataType.dataType.getCDeclaration());
-                        break;
-                    default:
-                        throw new Exception(UNEXPECTED_FORMAT+format);
-                }
-            } else if (match.charAt(0) == 'l') {
-                switch(match.charAt(1)) {
-                    case 'c':
-                        types.add(WCHAR);
-                        break;
-                    case 's':
-                        types.add(WCHAR_PTR);
-                        break;
-                    case 'i':
-                    case 'd':
-                    case 'o':
-                        types.add(LongDataType.dataType.getCDeclaration());
-                        break;
-                    case 'u':
-                    case 'x':
-                    case 'X':
-                        types.add(UnsignedLongDataType.dataType.getCDeclaration());
-                        break;
-                    case 'e':
-                    case 'E':
-                    case 'f':
-                    case 'g':
-                    case 'G':
-                        types.add(DOUBLE);
-                        break;
-                    default:
-                        throw new Exception(UNEXPECTED_FORMAT+format);
-                }
-            } else if (match.charAt(0) == 'L') {
-                switch(match.charAt(1)) {
-                    case 'e':
-                    case 'E':
-                    case 'f':
-                    case 'g':
-                    case 'G':
-                        types.add(LONG_DOUBLE);
-                        break;
-                    default:
-                        throw new Exception(UNEXPECTED_FORMAT+format);
-                }
-            } else {
-                switch(match.charAt(1)) {
-                    case 'c':
-                        types.add(CharDataType.dataType.getCDeclaration());
-                        break;
-                    case 's':
-                        types.add(CHAR_PTR);
-                        break;
-                    case 'i':
-                    case 'd':
-                    case 'o':
-                        types.add(IntegerDataType.dataType.getCDeclaration());
-                        break;
-                    case 'u':
-                    case 'x':
-                    case 'X':
-                        types.add(UnsignedIntegerDataType.dataType.getCDeclaration());
-                        break;
-                    case 'e':
-                    case 'E':
-                    case 'f':
-                    case 'g':
-                    case 'G':
-                        types.add(FLOAT);
-                        break;
-                    case 'p':
-                        types.add(POINTER);
-                        break;
-                    default:
-                        throw new Exception(UNEXPECTED_FORMAT+format);
-                }
-            }
-        }
-        if (types.isEmpty()) {
-            return null;
-        }
-        StringBuilder builder = new StringBuilder();
-        for (String type : types) {
-            builder.append(SEPARATOR)
-                    .append(type);
-        }
-        return parser.parse(null, String.format(DEC, builder.toString()));
+	private String getFmt() {
+		return PointerDataType.getPointer(CharDataType.dataType, -1).toString();
+	}
+
+	private static String getSpecifier(MatchResult r) {
+		return r.group(1);
+	}
+
+	private static String getDeclaration(DataType dt) {
+		if (dt instanceof AbstractIntegerDataType) {
+			return ((AbstractIntegerDataType) dt).getCDeclaration();
+		}
+		return dt.toString();
+	}
+
+	private FunctionDefinition getFunctionSignature(String format, Function function)
+		throws Exception {
+			Matcher matcher = FORMAT_PATTERN.matcher(format);
+			final StringJoiner joiner = new StringJoiner(DELIMITER, PREFIX, SUFFIX).add(getFmt());
+			matcher.results()
+				.map(PrintfSigOverrider::getSpecifier)
+				.map(this::toDataType)
+				.map(PrintfSigOverrider::getDeclaration)
+				.forEach(joiner::add);
+			return PARSER.parse(function.getSignature(), joiner.toString());
     }
 
     // These should be in a Util class somewhere!
@@ -262,5 +285,6 @@ public class PrintfSigOverrider extends GhidraScript {
             analyzer.flowConstants(program, function.getEntryPoint(), function.getBody(),
                                    symEval, monitor);
             return symEval;
-    }
+	}
+
 }
