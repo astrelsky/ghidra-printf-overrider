@@ -3,31 +3,25 @@
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
-import java.util.StringJoiner;
+import java.util.function.Predicate;
 import java.util.regex.MatchResult;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
 
 import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
 import ghidra.app.plugin.core.analysis.ConstantPropagationAnalyzer;
 import ghidra.app.script.GhidraScript;
-import ghidra.app.util.parser.FunctionSignatureParser;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.data.*;
 import ghidra.program.model.data.DataUtilities.ClearDataMode;
-import ghidra.program.model.listing.Data;
-import ghidra.program.model.listing.Function;
-import ghidra.program.model.listing.Instruction;
-import ghidra.program.model.listing.Parameter;
-import ghidra.program.model.listing.Program;
+import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.MemoryBlock;
-import ghidra.program.model.pcode.HighFunctionDBUtil;
-import ghidra.program.model.symbol.RefType;
-import ghidra.program.model.symbol.Reference;
-import ghidra.program.model.symbol.Symbol;
-import ghidra.program.model.symbol.SymbolType;
+import ghidra.program.model.pcode.DataTypeSymbol;
+import ghidra.program.model.pcode.HighFunction;
+import ghidra.program.model.symbol.*;
 import ghidra.program.util.SymbolicPropogator;
 import ghidra.util.classfinder.ClassSearcher;
 import ghidra.util.exception.CancelledException;
@@ -37,17 +31,18 @@ public class PrintfSigOverrider extends GhidraScript {
 
     private static final String PRINT_F = "printf";
     private static final String UNSUPPORTED_MESSAGE =
-        "Currently only processors passing parameters via registers are supported.";
+		"Currently only processors passing parameters via registers are supported.";
+	private static final String TMP_NAME = "tmpname";
+	private static final String NAME_ROOT = "prt";
+	private static final String AUTO_CAT = "/auto_proto";
 
     private static final Pattern FORMAT_PATTERN =
         Pattern.compile("%\\d*([lLh]?[cdieEfgGosuxXpn%])");
 
-    private static final String PREFIX = "int printf(";
-	private static final String DELIMITER = ",";
-	private static final String SUFFIX = ")";
+	private static final DataType CHAR_PTR = PointerDataType.getPointer(CharDataType.dataType, -1);
 	
-	private static final FunctionSignatureParser PARSER = 
-		new FunctionSignatureParser(BuiltInDataTypeManager.getDataTypeManager(), null);
+	private SymbolTable table;
+	private DataTypeManager dtm;
 
 	private static boolean isFunction(Symbol s) {
 		return s.getSymbolType() == SymbolType.FUNCTION;
@@ -63,6 +58,8 @@ public class PrintfSigOverrider extends GhidraScript {
 
     @Override
     public void run() throws Exception {
+		dtm = currentProgram.getDataTypeManager();
+		table = currentProgram.getSymbolTable();
 		Optional<Symbol> s = StreamSupport.stream(currentProgram.getSymbolTable()
 										  .getSymbolIterator(PRINT_F, true)
 										  .spliterator(), false)
@@ -78,9 +75,11 @@ public class PrintfSigOverrider extends GhidraScript {
 				popup(UNSUPPORTED_MESSAGE);
 				return;
 			}
+			final ReferenceManager manager = currentProgram.getReferenceManager();
 			List<Address> addresses = Arrays.stream(s.get().getReferences())
 					.filter(PrintfSigOverrider::isCall)
 					.map(Reference::getFromAddress)
+					.filter(Predicate.not(manager::hasReferencesTo))
 					.collect(Collectors.toList());
 			monitor.initialize(addresses.size());
 			monitor.setMessage("Overriding printf calls");
@@ -139,12 +138,16 @@ public class PrintfSigOverrider extends GhidraScript {
             try {
 				final FunctionDefinition def = getFunctionSignature(format, function);
 				if (def != null) {
-					HighFunctionDBUtil.writeOverride(function, address, def);
-					commit = true;
+					DataTypeSymbol symbol = new DataTypeSymbol(def, NAME_ROOT, AUTO_CAT);
+					Namespace space = HighFunction.findCreateOverrideSpace(function);
+					if (space != null) {
+						symbol.writeSymbol(table, address, space, dtm, true);
+						commit = true;
+					}
 				}
             }
             catch (Exception e) {
-                printerr("Error overriding signature: " + e.getMessage());
+				printerr("Error overriding signature: " + e.getMessage());
             }
             finally {
                 if (transaction != -1) {
@@ -153,7 +156,7 @@ public class PrintfSigOverrider extends GhidraScript {
             }
 	}
 	
-	private DataType toDataType(CharSequence match) {
+	private static DataType toDataType(CharSequence match) {
 		if (match.charAt(0) == 'h') {
 			switch(match.charAt(1)) {
 				case 'i':
@@ -165,8 +168,7 @@ public class PrintfSigOverrider extends GhidraScript {
 				case 'X':
 					return UnsignedShortDataType.dataType;
 				default:
-					printerr("Unknown specifier "+match);
-					return Undefined1DataType.dataType;
+					throw new IllegalArgumentException("Unknown specifier "+match);
 			}
 		} else if (match.charAt(0) == 'l') {
 			switch(match.charAt(1)) {
@@ -189,8 +191,7 @@ public class PrintfSigOverrider extends GhidraScript {
 				case 'G':
 					return DoubleDataType.dataType;
 				default:
-					printerr("Unknown specifier "+match);
-					return DataType.DEFAULT;
+					throw new IllegalArgumentException("Unknown specifier "+match);
 			}
 		} else if (match.charAt(0) == 'L') {
 			switch(match.charAt(1)) {
@@ -201,8 +202,7 @@ public class PrintfSigOverrider extends GhidraScript {
 				case 'G':
 					return LongDoubleDataType.dataType;
 				default:
-					printerr("Unknown specifier "+match);
-					return DataType.DEFAULT;
+					throw new IllegalArgumentException("Unknown specifier "+match);
 			}
 		} else {
 			switch(match.charAt(0)) {
@@ -227,37 +227,32 @@ public class PrintfSigOverrider extends GhidraScript {
 				case 'p':
 					return PointerDataType.dataType;
 				default:
-					printerr("Unknown specifier "+match);
-					return DataType.DEFAULT;
+					throw new IllegalArgumentException("Unknown specifier "+match);
 			}
 		}
-	}
-
-	private String getFmt() {
-		return PointerDataType.getPointer(CharDataType.dataType, -1).toString();
 	}
 
 	private static String getSpecifier(MatchResult r) {
 		return r.group(1);
 	}
 
-	private static String getDeclaration(DataType dt) {
-		if (dt instanceof AbstractIntegerDataType) {
-			return ((AbstractIntegerDataType) dt).getCDeclaration();
-		}
-		return dt.toString();
+	private static ParameterDefinition toParameter(DataType dt) {
+		return new ParameterDefinitionImpl(null, dt, null);
 	}
 
 	private FunctionDefinition getFunctionSignature(String format, Function function)
 		throws Exception {
-			Matcher matcher = FORMAT_PATTERN.matcher(format);
-			final StringJoiner joiner = new StringJoiner(DELIMITER, PREFIX, SUFFIX).add(getFmt());
-			matcher.results()
-				.map(PrintfSigOverrider::getSpecifier)
-				.map(this::toDataType)
-				.map(PrintfSigOverrider::getDeclaration)
-				.forEach(joiner::add);
-			return PARSER.parse(function.getSignature(), joiner.toString());
+			final FunctionDefinition def = new FunctionDefinitionDataType(TMP_NAME);
+			final Matcher matcher = FORMAT_PATTERN.matcher(format);
+			final Stream<DataType> types = matcher.results()
+												  .map(PrintfSigOverrider::getSpecifier)
+												  .map(PrintfSigOverrider::toDataType);
+			ParameterDefinition[] params = Stream.concat(Stream.of(CHAR_PTR), types)
+												 .map(PrintfSigOverrider::toParameter)
+												 .toArray(ParameterDefinition[]::new);
+			def.setArguments(params);
+			def.setReturnType(IntegerDataType.dataType);
+			return def;
     }
 
     // These should be in a Util class somewhere!
