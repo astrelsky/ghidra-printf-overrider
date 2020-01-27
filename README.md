@@ -6,3 +6,5 @@ and overrides the signature accordingly at the call address.
 
 Currently only compiler specs that pass parameters by register are supported.
 All contributions are welcome.
+
+Moved to https://github.com/astrelsky/ghidra_scripts
